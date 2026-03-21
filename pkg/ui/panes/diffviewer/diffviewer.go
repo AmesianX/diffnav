@@ -113,7 +113,7 @@ func (m *Model) SetSize(width, height int) tea.Cmd {
 	m.Height = height
 	m.vp.SetWidth(m.contentWidth())
 	m.vp.SetHeight(m.Height - dirHeaderHeight)
-	m.cache = make(nodeCache)
+	m.ClearCache()
 	return m.diff()
 }
 
@@ -368,7 +368,10 @@ func renderPreamble(preamble string) string {
 	for _, line := range strings.Split(preamble, "\n") {
 		switch {
 		case strings.HasPrefix(line, "commit "):
-			out = append(out, dim.Render("commit ")+yellow.Render(strings.TrimPrefix(line, "commit ")))
+			out = append(
+				out,
+				dim.Render("commit ")+yellow.Render(strings.TrimPrefix(line, "commit ")),
+			)
 		case strings.HasPrefix(line, "Author:"),
 			strings.HasPrefix(line, "AuthorDate:"),
 			strings.HasPrefix(line, "Date:"),
@@ -387,6 +390,10 @@ func renderPreamble(preamble string) string {
 type diffContentMsg struct {
 	cacheKey string
 	text     string
+}
+
+func (m *Model) ClearCache() {
+	m.cache = make(nodeCache)
 }
 
 func (m *Model) RootDiffStats() (int64, int64) {

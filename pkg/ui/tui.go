@@ -26,6 +26,7 @@ import (
 	"github.com/dlvhdr/diffnav/pkg/ui/panes/filetree"
 	"github.com/dlvhdr/diffnav/pkg/ui/panes/help"
 	"github.com/dlvhdr/diffnav/pkg/utils"
+	"github.com/dlvhdr/diffnav/pkg/watch"
 	"github.com/lrstanley/go-nf/glyphs/md"
 	"github.com/lrstanley/go-nf/glyphs/neo"
 )
@@ -87,12 +88,24 @@ type mainModel struct {
 	preamble          string
 	commitBranch      string
 	cachedMeta        commitMeta
+	watchEnabled      bool
+	watchCmd          string
+	watchInterval     time.Duration
+	pendingCursorPath string
+	watchInFlight     bool
 }
 
 func New(input string, cfg config.Config) mainModel {
 	m := mainModel{
-		input: input, isShowingFileTree: cfg.UI.ShowFileTree,
-		activePanel: FileTreePanel, config: cfg, iconStyle: cfg.UI.Icons, sideBySide: cfg.UI.SideBySide,
+		input:             input,
+		isShowingFileTree: cfg.UI.ShowFileTree,
+		activePanel:       FileTreePanel,
+		config:            cfg,
+		iconStyle:         cfg.UI.Icons,
+		sideBySide:        cfg.UI.SideBySide,
+		watchEnabled:      cfg.Watch.Enabled,
+		watchCmd:          cfg.Watch.Cmd,
+		watchInterval:     cfg.Watch.Interval,
 	}
 	m.fileTree = filetree.New(cfg)
 	m.fileTree.SetSize(cfg.UI.FileTreeWidth, 0)
@@ -118,8 +131,30 @@ func New(input string, cfg config.Config) mainModel {
 	return m
 }
 
+type watchTickMsg struct{ time.Time }
+
+type watchResultMsg struct {
+	output string
+	err    error
+}
+
 func (m mainModel) Init() tea.Cmd {
-	return tea.Batch(m.fetchFileTree, m.diffViewer.Init())
+	cmds := []tea.Cmd{m.fetchFileTree, m.diffViewer.Init()}
+	if m.watchEnabled {
+		cmds = append(cmds, m.scheduleWatchTick())
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m mainModel) scheduleWatchTick() tea.Cmd {
+	return tea.Tick(m.watchInterval, func(t time.Time) tea.Msg {
+		return watchTickMsg{t}
+	})
+}
+
+func (m mainModel) fetchWatchDiff() tea.Msg {
+	output, err := watch.RunCmd(m.watchCmd)
+	return watchResultMsg{output: output, err: err}
 }
 
 func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -270,9 +305,33 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateMessageVp()
 		}
 
+	case watchTickMsg:
+		if m.watchInFlight {
+			return m, nil
+		}
+		m.watchInFlight = true
+		return m, m.fetchWatchDiff
+
+	case watchResultMsg:
+		m.watchInFlight = false
+		if msg.err != nil {
+			log.Warn("watch command failed", "err", msg.err)
+			cmds = append(cmds, m.scheduleWatchTick())
+			return m, tea.Batch(cmds...)
+		}
+		if msg.output == m.input {
+			cmds = append(cmds, m.scheduleWatchTick())
+			return m, tea.Batch(cmds...)
+		}
+		m.pendingCursorPath = m.fileTree.CurrNodePath()
+		m.diffViewer.ClearCache()
+		m.input = msg.output
+		cmds = append(cmds, m.fetchFileTree, m.scheduleWatchTick())
+		return m, tea.Batch(cmds...)
+
 	case fileTreeMsg:
 		m.files = msg.files
-		if len(m.files) == 0 {
+		if len(m.files) == 0 && !m.watchEnabled {
 			return m, tea.Quit
 		}
 		m.fileTree = m.fileTree.SetFiles(m.files)
@@ -282,6 +341,13 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diffViewer.SetPreamble(m.preamble)
 		m.diffViewer, cmd = m.diffViewer.SetDirPatch("/", m.fileTree.GetCurrNodeDesendantDiffs())
 		cmds = append(cmds, cmd)
+		if m.pendingCursorPath != "" {
+			m.fileTree.SetCursorByPath(m.pendingCursorPath)
+			node := m.fileTree.GetCurrNode()
+			m, cmd = m.setNodeDiff(node)
+			cmds = append(cmds, cmd)
+			m.pendingCursorPath = ""
+		}
 
 	case common.ErrMsg:
 		fmt.Printf("Error: %v\n", msg.Err)
@@ -420,7 +486,9 @@ func (m mainModel) View() tea.View {
 				Render(strings.Repeat("─", rightW))
 			separator = leftLine + junction + rightLine
 		} else {
-			separator = lipgloss.NewStyle().Foreground(rightColor).Render(strings.Repeat("─", m.width))
+			separator = lipgloss.NewStyle().
+				Foreground(rightColor).
+				Render(strings.Repeat("─", m.width))
 		}
 	}
 
@@ -657,16 +725,22 @@ func (m mainModel) viewHeader() string {
 		infoParts = append(infoParts, hashStyle.Render(meta.hash))
 		if meta.date != "" {
 			if m.iconStyle != filenode.IconsASCII && m.iconStyle != filenode.IconsUnicode {
-				infoParts = append(infoParts, dateStyle.Render(string(md.ClockOutline) + " " + meta.date))
+				infoParts = append(
+					infoParts,
+					dateStyle.Render(string(md.ClockOutline)+" "+meta.date),
+				)
 			} else {
 				infoParts = append(infoParts, dateStyle.Render(meta.date))
 			}
 		}
 		if meta.author != "" {
 			if m.iconStyle != filenode.IconsASCII && m.iconStyle != filenode.IconsUnicode {
-				infoParts = append(infoParts, authorStyle.Render(string(md.AccountCircleOutline) + " " + meta.author))
+				infoParts = append(
+					infoParts,
+					authorStyle.Render(string(md.AccountCircleOutline)+" "+meta.author),
+				)
 			} else {
-			infoParts = append(infoParts, authorStyle.Render(meta.author))
+				infoParts = append(infoParts, authorStyle.Render(meta.author))
 			}
 		}
 		headerParts = headerParts + sep + strings.Join(infoParts, sep)
@@ -699,19 +773,36 @@ func (m mainModel) viewHeader() string {
 func (m mainModel) footerView() string {
 	base := lipgloss.NewStyle().Background(common.Colors[common.DarkerSelected])
 	files := fmt.Sprintf(" %d files", len(m.files))
-	sep := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Render(" • ")
+	sep := base.Foreground(lipgloss.BrightBlack).Render(" • ")
 	added, deleted := m.diffViewer.RootDiffStats()
-	help := zone.Mark(zoneHelp, base.Background(lipgloss.BrightBlack).PaddingLeft(1).PaddingRight(1).Render("F1/? help"))
+	help := zone.Mark(
+		zoneHelp,
+		base.Background(lipgloss.BrightBlack).PaddingLeft(1).PaddingRight(1).Render("F1/? help"),
+	)
 	stats := filenode.ViewDiffStats(added, deleted, base)
+	parts := []string{files, sep, stats}
+	usedWidth := lipgloss.Width(
+		stats,
+	) + lipgloss.Width(
+		help,
+	) + lipgloss.Width(
+		files,
+	) + lipgloss.Width(
+		sep,
+	)
 
-	left := lipgloss.JoinHorizontal(lipgloss.Top, files, sep, stats)
-	rightWidth := lipgloss.Width(help)
+	if m.watchEnabled {
+		watchLabel := base.Foreground(lipgloss.Yellow).Render("watching: " + m.watchCmd)
+		parts = append(parts, sep, watchLabel)
+		usedWidth += lipgloss.Width(sep) + lipgloss.Width(watchLabel)
+	}
 
-	spacing := base.Render(strings.Repeat(" ", max(0, m.width-lipgloss.Width(left)-rightWidth)))
+	spacing := base.Render(strings.Repeat(" ", max(0, m.width-usedWidth)))
+	parts = append(parts, spacing, help)
 	return base.
 		Width(m.width).
 		Height(1).
-		Render(lipgloss.JoinHorizontal(lipgloss.Top, left, spacing, help))
+		Render(lipgloss.JoinHorizontal(lipgloss.Top, parts...))
 }
 
 func (m *mainModel) messageView() string {
@@ -724,7 +815,10 @@ func (m *mainModel) messageView() string {
 	for line := range strings.SplitSeq(m.preamble, "\n") {
 		switch {
 		case strings.HasPrefix(line, "commit "):
-			out = append(out, dim.Render("commit ")+yellow.Render(strings.TrimPrefix(line, "commit ")))
+			out = append(
+				out,
+				dim.Render("commit ")+yellow.Render(strings.TrimPrefix(line, "commit ")),
+			)
 		case strings.HasPrefix(line, "Author:"),
 			strings.HasPrefix(line, "AuthorDate:"),
 			strings.HasPrefix(line, "Date:"),
@@ -743,7 +837,7 @@ func (m *mainModel) messageView() string {
 func (m *mainModel) updateMessageVp() {
 	s := overlayStyle()
 	maxWidth := min(m.width*3/4, 80)
-	maxHeight := max(m.height/2 - s.GetVerticalFrameSize(), 5)
+	maxHeight := max(m.height/2-s.GetVerticalFrameSize(), 5)
 	content := lipgloss.NewStyle().Width(maxWidth).Render(m.messageView())
 	m.messageVp.SetWidth(maxWidth)
 	m.messageVp.SetHeight(maxHeight)
@@ -805,7 +899,14 @@ func (m mainModel) resultsView() string {
 		}
 		if i == m.resultsCursor {
 			bg := lipgloss.NewStyle().Background(lipgloss.Color("#1b1b33"))
-			fName := lipgloss.NewStyle().Bold(true).Render(bg.Render(base)) + bg.Render(" ") + bg.Render(dir)
+			fName := lipgloss.NewStyle().
+				Bold(true).
+				Render(bg.Render(base)) +
+				bg.Render(
+					" ",
+				) + bg.Render(
+				dir,
+			)
 			sb.WriteString(bg.
 				Width(m.config.UI.SearchTreeWidth).
 				Render(fName) +
@@ -891,8 +992,8 @@ func overlayStyle() lipgloss.Style {
 }
 
 type overlayResult struct {
-	rendered     string
-	col, row     int
+	rendered      string
+	col, row      int
 	width, height int
 }
 
@@ -924,7 +1025,8 @@ func (m mainModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 					content = m.help.View()
 				}
 				o := m.renderOverlay(content)
-				if msg.X < o.col || msg.X >= o.col+o.width || msg.Y < o.row || msg.Y >= o.row+o.height {
+				if msg.X < o.col || msg.X >= o.col+o.width || msg.Y < o.row ||
+					msg.Y >= o.row+o.height {
 					// Click outside: close overlay.
 					m.messageOpen = false
 					m.helpOpen = false
@@ -955,7 +1057,8 @@ func (m mainModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if msg.Button == tea.MouseLeft {
 			// Keep coordinate check for resize border (hybrid approach).
 			sidebarWidth := m.sidebarWidth()
-			if !m.searching && m.isShowingFileTree && abs(msg.X-sidebarWidth) <= sidebarGrabThreshold {
+			if !m.searching && m.isShowingFileTree &&
+				abs(msg.X-sidebarWidth) <= sidebarGrabThreshold {
 				m.draggingSidebar = true
 				return m, nil
 			}
